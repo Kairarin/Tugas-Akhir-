@@ -1,19 +1,19 @@
 """
-Flask IDS Server v6.1 (RF + XGBOOST + IDS STATE MACHINE)
-==========================================================
-TAMBAHAN dari v6.0:
-  [NEW] IDS State Machine: persistence, hysteresis, cooldown, recovery
-  [NEW] Temporary Status per-baris
-  [NEW] Final Status berbasis state machine
-  [NEW] Terminal dashboard box layout per baris
-  [NEW] Full text label (INTERVAL, LATENCY, JITTER, PACKET RATE)
-  [NEW] CSV tambahan kolom: temporary_status, final_status, attack_counter, recovery_counter
+Flask IDS Server v7.0 (RF + XGBOOST + IDS STATE MACHINE + RESOURCE MONITORING)
+================================================================================
+TAMBAHAN dari v6.1:
+  [NEW] Import psutil untuk membaca resource Raspberry Pi (CPU%, Memory%)
+  [NEW] Fungsi get_pi_resources() — dipanggil setiap update dashboard
+  [NEW] Terima field baru dari ESP32: free_heap, heap_usage, cpu_load
+  [NEW] Panel SYSTEM RESOURCE di dashboard (bawah IDS DETECTION STATS)
+  [NEW] CSV tambahan kolom: esp32_heap_usage, esp32_cpu_load, pi_cpu, pi_memory
+        (kolom lama tidak berubah urutan/namanya)
 
 TIDAK DIUBAH:
   arsitektur, Flask routes, async CSV, queue, threading,
   Waitress, health endpoint, /status, /setlabel,
   ML inference workflow, rolling stats, model loading,
-  ESP32 payload structure
+  ESP32 payload structure lama, state machine, semua logika IDS
 """
 
 from flask import Flask, request, jsonify
@@ -24,6 +24,15 @@ from datetime import datetime
 from collections import deque
 import joblib
 import warnings
+
+# ─── PSUTIL untuk resource Raspberry Pi ──────────────────
+try:
+    import psutil
+    PSUTIL_READY = True
+except ImportError:
+    psutil = None
+    PSUTIL_READY = False
+    print("\033[93m[WARN] psutil tidak terinstall. Jalankan: pip install psutil\033[0m")
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -41,11 +50,17 @@ _ROLLING_N    = 200
 current_label = os.environ.get("LABEL_MODE", "normal")
 
 CSV_COLUMNS = [
+    # ── Kolom lama (urutan tidak berubah) ─────────────
     "timestamp_unix", "timestamp_esp", "device_id",
     "interval_ms", "latency_ms", "jitter_ms", "packet_rate",
     "label_aktual", "prediksi_rf", "prediksi_xgb",
     "temporary_status", "final_status",
-    "attack_counter", "recovery_counter"
+    "attack_counter", "recovery_counter",
+    # ── Kolom baru resource monitoring (ditambahkan di akhir) ──
+    "esp32_heap_usage",   # heap usage ESP32 dalam persen (%)
+    "esp32_cpu_load",     # estimasi CPU load ESP32 dalam persen (%)
+    "pi_cpu",             # CPU usage Raspberry Pi dalam persen (%)
+    "pi_memory",          # Memory usage Raspberry Pi dalam persen (%)
 ]
 
 FEATURE_COLS = ["interval_ms", "latency_ms", "jitter_ms", "packet_rate"]
@@ -60,6 +75,35 @@ CY  = "\033[96m"
 BL  = "\033[94m"
 MA  = "\033[95m"
 WHI = "\033[97m"
+
+# ─── RESOURCE MONITORING STATE ───────────────────────────
+# Menyimpan nilai resource terakhir yang diterima/dibaca.
+# Diupdate setiap request /data masuk (dari ESP32) dan setiap
+# print_ids_box() dipanggil (untuk Pi).
+_resource_lock    = threading.Lock()
+_last_resource    = {
+    "esp32_heap_usage" : 0.0,
+    "esp32_cpu_load"   : 0.0,
+    "pi_cpu"           : 0.0,
+    "pi_memory"        : 0.0,
+}
+
+def get_pi_resources():
+    """Baca CPU dan Memory Raspberry Pi via psutil secara non-blocking."""
+    if not PSUTIL_READY:
+        return 0.0, 0.0
+    try:
+        cpu_pct = psutil.cpu_percent(interval=None)   # non-blocking, pakai cached value
+        mem     = psutil.virtual_memory()
+        mem_pct = mem.percent
+        return round(cpu_pct, 1), round(mem_pct, 1)
+    except Exception:
+        return 0.0, 0.0
+
+# Panggil cpu_percent() sekali saat startup untuk inisialisasi baseline psutil
+# (panggilan pertama selalu mengembalikan 0.0 jika interval=None)
+if PSUTIL_READY:
+    psutil.cpu_percent(interval=0.1)
 
 # ─── LOAD MODEL ──────────────────────────────────────────
 print(f"\n{CY}{'='*60}{R}")
@@ -324,7 +368,8 @@ def _bar(current, total, width=10, filled_char="█", empty_char="░"):
 
 def print_ids_box(waktu, interval_ms, latency_ms, jitter_ms, packet_rate,
                   rf_label, xgb_label, temp_status, final_status_str,
-                  attack_ctr, recovery_ctr, device_id="unknown"):
+                  attack_ctr, recovery_ctr, device_id="unknown",
+                  esp32_heap=0.0, esp32_cpu=0.0, pi_cpu=0.0, pi_mem=0.0):
     """Cetak dashboard realtime 3 kolom yang lebih rapi dan profesional."""
 
     import shutil
@@ -428,6 +473,16 @@ def print_ids_box(waktu, interval_ms, latency_ms, jitter_ms, packet_rate,
     # Panel kanan
     normal_rate = (out_normal / out_total * 100.0) if out_total else 0.0
     dos_rate    = (out_dos / out_total * 100.0) if out_total else 0.0
+
+    # Warna resource: hijau jika aman, kuning jika sedang, merah jika tinggi
+    def color_res(val, warn=60.0, crit=85.0):
+        if val >= crit:
+            return f"{RE}{BO}{val:.1f}%{R}"
+        elif val >= warn:
+            return f"{YE}{val:.1f}%{R}"
+        else:
+            return f"{YE}{val:.1f}%{R}"   # default kuning sesuai style dashboard
+
     right_rows = [
         f"{BO}{CY}IDS DETECTION STATS{R}",
         f"{YE}├{R} Processed Data   : {WHI}{out_total}{R}",
@@ -435,6 +490,13 @@ def print_ids_box(waktu, interval_ms, latency_ms, jitter_ms, packet_rate,
         f"{YE}├{R} Detected DoS     : {RE}{out_dos}{R}",
         f"{YE}├{R} Normal Rate      : {WHI}{normal_rate:.1f}%{R}",
         f"{YE}└{R} DoS Rate         : {WHI}{dos_rate:.1f}%{R}",
+        "",
+        # ── Panel SYSTEM RESOURCE (baru, di bawah Detection Stats) ──
+        f"{BO}{BL}SYSTEM RESOURCE{R}",
+        f"{YE}├{R} ESP32 CPU        : {color_res(esp32_cpu)}",
+        f"{YE}├{R} ESP32 Memory     : {color_res(esp32_heap)}",
+        f"{YE}├{R} Pi CPU           : {color_res(pi_cpu)}",
+        f"{YE}└{R} Pi Memory        : {color_res(pi_mem)}",
     ]
 
     top_border()
@@ -472,6 +534,10 @@ def terima_data():
     latency_ms  = int(data.get("latency_ms",   0))
     jitter_ms   = int(data.get("jitter_ms",    0))
     packet_rate = float(data.get("packet_rate",  0.0))
+
+    # ── Field resource baru dari ESP32 (aman jika tidak ada — backward compat) ──
+    esp32_heap_usage = float(data.get("heap_usage", 0.0))
+    esp32_cpu_load   = float(data.get("cpu_load",   0.0))
 
     # ── ML Inference ─────────────────────────────────────
     pred_rf       = "unknown"
@@ -513,16 +579,29 @@ def terima_data():
         atk_ctr = IDS_ATTACK_COUNTER
         rec_ctr = IDS_RECOVERY_COUNTER
 
+    # ── Baca resource Raspberry Pi (non-blocking) ─────────
+    pi_cpu_now, pi_mem_now = get_pi_resources()
+
+    # Update resource state global agar /status juga bisa mengembalikannya
+    with _resource_lock:
+        _last_resource["esp32_heap_usage"] = esp32_heap_usage
+        _last_resource["esp32_cpu_load"]   = esp32_cpu_load
+        _last_resource["pi_cpu"]           = pi_cpu_now
+        _last_resource["pi_memory"]        = pi_mem_now
+
     # ── Print box ─────────────────────────────────────────
     waktu = datetime.fromtimestamp(server_time).strftime("%H:%M:%S")
     print_ids_box(
         waktu, interval_ms, latency_ms, jitter_ms, packet_rate,
         pred_rf, pred_xgb, temp_status, final_st,
-        atk_ctr, rec_ctr, device_id=device_id
+        atk_ctr, rec_ctr, device_id=device_id,
+        esp32_heap=esp32_heap_usage, esp32_cpu=esp32_cpu_load,
+        pi_cpu=pi_cpu_now, pi_mem=pi_mem_now,
     )
 
     # ── Async CSV write ───────────────────────────────────
     row = {
+        # Kolom lama (tidak berubah)
         "timestamp_unix"   : round(server_time, 3),
         "timestamp_esp"    : int(esp_ts),
         "device_id"        : str(device_id),
@@ -537,6 +616,11 @@ def terima_data():
         "final_status"     : final_st,
         "attack_counter"   : atk_ctr,
         "recovery_counter" : rec_ctr,
+        # Kolom baru resource (ditambahkan di akhir)
+        "esp32_heap_usage" : round(esp32_heap_usage, 1),
+        "esp32_cpu_load"   : round(esp32_cpu_load,   1),
+        "pi_cpu"           : round(pi_cpu_now,        1),
+        "pi_memory"        : round(pi_mem_now,        1),
     }
     try:
         write_queue.put_nowait(row)
@@ -596,13 +680,14 @@ def status():
 # ─── MAIN ────────────────────────────────────────────────
 if __name__ == "__main__":
     print(f"{CY}{'═'*60}{R}")
-    print(f"{BO}  🛡️  EDGE IDS SERVER v6.1 — RF + XGBoost + State Machine{R}")
+    print(f"{BO}  🛡️  EDGE IDS SERVER v7.0 — RF + XGBoost + State Machine + Resource{R}")
     print(f"  Port            : {PORT}")
     print(f"  Log file        : {CSV_FILE}")
     print(f"  ML Status       : {f'{GR}READY{R}' if ML_READY else f'{RE}NOT READY{R}'}")
     print(f"  Attack threshold: {ATTACK_CONFIRM_THRESHOLD} hit berturut-turut")
     print(f"  Recovery thresh : {RECOVERY_NORMAL_THRESHOLD} normal berturut-turut")
     print(f"  Fitur           : INTERVAL | LATENCY | JITTER | PACKET RATE")
+    print(f"  Resource Monitor: {f'{GR}psutil READY{R}' if PSUTIL_READY else f'{YE}psutil NOT FOUND — pip install psutil{R}'}")
     print(f"{CY}{'═'*60}{R}\n")
 
     try:
